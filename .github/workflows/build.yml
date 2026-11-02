@@ -1,10 +1,17 @@
 name: "Build"
 
-on: [push, pull_request, workflow_dispatch]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -12,7 +19,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v3
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         with:
           path: ~/.m2/repository
           key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
@@ -26,4 +33,65 @@ jobs:
           distribution: 'temurin'
 
       - name: Build
-        run: mvn -B clean verify
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn -B clean verify -Dtest="${{ inputs.test-filter }}" -Dsurefire.failIfNoSpecifiedTests=false -DfailIfNoTests=false
+          else
+            mvn -B clean verify
+          fi
+
+      - name: Report skipped tests
+        shell: bash
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re, xml.etree.ElementTree as ET
+
+          def python_reason(classname, name):
+              # proton_tests.<module>.<Class> -> tests/python/proton_tests/<module>.py
+              parts = classname.split('.')
+              src = os.path.join('tests', 'python', *parts[:-1]) + '.py'
+              if not os.path.exists(src):
+                  return None
+              lines = open(src).read().splitlines()
+              for i, line in enumerate(lines):
+                  if re.match(r'\s*def %s\(' % re.escape(name), line):
+                      body = lines[i + 1:i + 10]
+                      for j, b in enumerate(body):
+                          if 'raise Skipped' in b:
+                              cond = next((c.strip() for c in reversed(body[:j]) if c.strip().startswith('if ')), '')
+                              return f"Python test raises Skipped on Jython ({src}:{i + 2 + j}: {cond} -> {b.strip()})"
+              return None
+
+          n = 0
+          for f in sorted(glob.glob('**/target/surefire-reports/*.xml', recursive=True)):
+              try:
+                  root = ET.parse(f).getroot()
+              except ET.ParseError:
+                  continue
+              for tc in root.iter('testcase'):
+                  sk = tc.find('skipped')
+                  if sk is not None:
+                      n += 1
+                      cls, name = tc.get('classname') or '', tc.get('name') or ''
+                      msg = sk.get('message') or (sk.text or '').strip()
+                      if cls.startswith('proton_tests.'):
+                          msg = python_reason(cls, name) or msg
+                      if not msg:
+                          msg = 'JUnit @Ignore without message (upstream-disabled in source)'
+                      print(f"SKIPPED {cls}.{name}: {msg}")
+          print(f"Total skipped testcases in surefire reports: {n}")
+          EOF
+          echo "--- Python suite ignore file (tests/java/pythonTests.ignore), excluded from Jython run by upstream:"
+          cat tests/java/pythonTests.ignore
+
+      - name: Upload proton-j jar
+        if: matrix.java == 8
+        uses: actions/upload-artifact@v4
+        with:
+          name: proton-j-jar
+          path: |
+            proton-j/target/proton-j-*.jar
+            !proton-j/target/*-sources.jar
+            !proton-j/target/*-javadoc.jar
+            !proton-j/target/*-tests.jar
+          if-no-files-found: error
